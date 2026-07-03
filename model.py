@@ -41,8 +41,8 @@ class Config:
         self.grad_clip = 1.0
 
         self.warmup_steps = 2000
-        self.lr_decay_steps = 500000
-        self.max_steps = 500000
+        self.lr_decay_steps = 6000000
+        self.max_steps = 6000000
 
         self.decay_lr = True
 
@@ -214,6 +214,7 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
     # weight tying used to make the weights of embedding and
     # head point to the samme parameters it's easier to learn one representation 
     self.lm_head.weight = self.token_embedding_table.weight
+    self.apply(self._init_weights)
 
     self.dropout = nn.Dropout(cfg.dropout)
     self.gradient_checkpointing = False
@@ -267,7 +268,24 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
   
   def gradient_checkpointing_enable(self):
     self.gradient_checkpointing = True
+  
+  def _init_weights(self, module):
 
+    if isinstance(module, nn.Linear):
+
+        torch.nn.init.normal_(
+            module.weight,
+            mean=0,
+            std=0.02
+        )
+
+    elif isinstance(module, nn.Embedding):
+
+        torch.nn.init.normal_(
+            module.weight,
+            mean=0,
+            std=0.02
+        )
 
 @torch.no_grad()
 def estimate_loss(model_name):

@@ -20,6 +20,10 @@ training_image = (
 
 app = modal.App("gemma3-pretraining-ddp")
 
+from huggingface_hub import HfApi
+
+api = HfApi()
+
 # --- DATA STREAMER UTIL ---
 def token_streamer(dataset, tokenizer, block_size, batch_size, device):
     buffer = []
@@ -73,8 +77,17 @@ def estimate_loss(model, train_iter, val_iter, tokenizer, cfg, device, eval_iter
     model.train()
     return out
 
+def get_parameter_norm(model):
+    total = 0.0
 
-def get_lr(step):
+    for p in model.parameters():
+        if p.requires_grad:
+            total += p.data.norm(2).item() ** 2
+
+    return total ** 0.5
+
+
+def get_lr(step, cfg):
 
     if step < cfg.warmup_steps:
         return cfg.learning_rate * step / cfg.warmup_steps
@@ -126,7 +139,7 @@ def ddp_worker(rank, world_size):
             project="gemma-500m-pretraining", 
             name="smollm-ddp-run",
             config={
-                "learning_rate": cfg.learnin_rate,
+                "learning_rate": cfg.learning_rate,
                 "architecture": "Gemma 3 Custom DDP",
                 "dataset": "HuggingFaceTB/smollm-corpus",
                 "batch_size": cfg.batch_size,
@@ -147,6 +160,17 @@ def ddp_worker(rank, world_size):
     print(f"[Rank {rank}] DDP wrapping...", flush=True)
     model = DDP(model, device_ids=[rank])
     raw_model = model.module
+    decay = []
+    no_decay = []
+
+    for name, param in raw_model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        if param.ndim >= 2:
+            decay.append(param)
+        else:
+            no_decay.append(param)
 
     optimizer = torch.optim.AdamW(
                     [
@@ -171,20 +195,21 @@ def ddp_worker(rank, world_size):
     
     model.train()
     print(f"[Rank {rank}] Starting training...", flush=True)
-    
+    t0 = time.time()
+    optimizer.zero_grad(set_to_none=True)
     for step in range(cfg.max_steps):
 
-        lr = get_lr(step)
+        lr = get_lr(step, cfg)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
-            
+        
+        
         # Evaluation Block (Handled by Master Process)
         if (step % cfg.n_eval == 0 or step == cfg.max_steps - 1) and master_process:
             losses = estimate_loss(model, train_iterator, val_iterator, tokenizer, cfg, device, eval_iters=10)
             print(f"Step {step:06d}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}", flush=True)
-            wandb.log({"train/loss": losses['train'], "val/loss": losses['val'], "step": step})
+            wandb.log({"train/loss": losses['train'], "val/loss": losses['val'], "step": step, "lr": lr})
 
-        optimizer.zero_grad(set_to_none=True)
         
         # Micro-stepping accumulation loop
         for micro_step in range(gradient_accumulation_steps):
@@ -205,21 +230,82 @@ def ddp_worker(rank, world_size):
                 if loss.dim() > 0:  
                     loss = loss.mean()
                 loss = loss / gradient_accumulation_steps
-
+        
             loss.backward()
 
+
         # Optimizer execution step
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+                        model.parameters(),
+                        cfg.grad_clip
+                    )
         optimizer.step()
-        
+        dt = time.time() - t0
+        t0 = time.time()
+
+        tokens_processed = (
+            cfg.batch_size
+            * cfg.block_size
+            * gradient_accumulation_steps
+            * world_size
+        )
+
+        samples_processed = (
+            cfg.batch_size
+            * gradient_accumulation_steps
+            * world_size
+        )
+
+        tokens_per_sec = tokens_processed / dt
+        samples_per_sec = samples_processed / dt
+
+        gpu_mem = torch.cuda.max_memory_allocated() / 1024**3
+
+        param_norm = get_parameter_norm(raw_model)
+
+        remaining_steps = cfg.max_steps - step
+
+        eta_hours = remaining_steps * dt / 3600
         if master_process:
-            wandb.log({"batch/loss": loss.item() * gradient_accumulation_steps})
+            wandb.log({
+            "train/loss": loss.item() * gradient_accumulation_steps,
+            "lr": lr,
+            "grad_norm": grad_norm.item(),
+            "param_norm": param_norm,
+            "tokens/sec": tokens_per_sec,
+            "samples/sec": samples_per_sec,
+            "gpu_memory_gb": gpu_mem,
+            "step": step,
+            "train/eta_hours": eta_hours
+        })
+        torch.cuda.reset_peak_memory_stats()
+        optimizer.zero_grad(set_to_none=True)
 
         # Save Checkpoint State safely
-        if step > 0 and step % 500 == 0 and master_process:
-            print(f"Saving and pushing checkpoint at step {step} to Hugging Face...", flush=True)
-            raw_model.push_to_hub("notninja/gemma-500m-smollm", commit_message=f"Training step {step}")
-            
+        if step > 0 and step % 5000 == 0 and master_process:
+            print(f"Saving checkpoint {step}")
+
+            torch.save(
+                {
+                    "step": step,
+                    "model": raw_model.state_dict(),
+                    "optimizer": optimizer.state_dict(),
+                    "config": cfg.__dict__,
+                },
+                "checkpoint.pt",
+            )
+
+            api.upload_file(
+                path_or_fileobj="checkpoint.pt",
+                path_in_repo="checkpoint_latest.pt",
+                repo_id="notninja/gemma-500m-smollm",
+                repo_type="model",
+            )
+
+            # raw_model.push_to_hub(
+            #     "notninja/gemma-500m-smollm",
+            #     commit_message=f"Training step {step}",
+            # )    
     if master_process:
         wandb.finish()
         
@@ -250,6 +336,6 @@ def train():
         join=True
     )
 
-if __name__ == "__main__":
-    with app.run():
-        train.remote()
+@app.local_entrypoint()
+def main():
+    train.spawn()
