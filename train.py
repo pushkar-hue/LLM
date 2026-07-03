@@ -12,7 +12,7 @@ tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-v0.1")
 
 vocab_size = len(tokenizer) # Usually 32000 for Mistral
 
-model = Gemma3LanguageModel(vocab_size=vocab_size).to(device)
+model = Gemma3LanguageModel(vocab_size=vocab_size).to(device=device, dtype=torch.bfloat16)
 model = torch.compile(model)  # Compile the model for performance optimization
 
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.learnin_rate, weight_decay=0.1)

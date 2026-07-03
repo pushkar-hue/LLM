@@ -3,21 +3,35 @@ import math
 import time
 import modal
 
-# 1. Container Image Definition
+
 training_image = (
-    modal.Image.from_registry("nvidia/cuda:12.1.1-devel-ubuntu22.04", add_python="3.10")
+    modal.Image.from_registry(
+        "nvidia/cuda:12.1.1-devel-ubuntu22.04",
+        add_python="3.10"
+    )
     .pip_install(
         "torch>=2.4.0",
+        index_url="https://download.pytorch.org/whl/cu121",
+    )
+    .pip_install(
+        "ninja",
+        "packaging",
+        "wheel",
+    )
+    .pip_install(
+        "flash-attn",
+        extra_options="--no-build-isolation",
+    )
+    .pip_install(
         "transformers",
         "datasets",
         "huggingface_hub",
         "accelerate",
-        "wandb"
+        "wandb",
     )
-    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"}) 
+    .env({"PYTORCH_CUDA_ALLOC_CONF": "expandable_segments:True"})
     .add_local_file("model.py", remote_path="/root/model.py")
 )
-
 app = modal.App("gemma3-pretraining-ddp")
 
 from huggingface_hub import HfApi
@@ -44,7 +58,6 @@ def token_streamer(dataset, tokenizer, block_size, batch_size, device):
             yield (torch.tensor(X_batch, dtype=torch.long, device=device), 
                    torch.tensor(Y_batch, dtype=torch.long, device=device))
 
-# --- ESTIMATE LOSS UTIL ---
 def estimate_loss(model, train_iter, val_iter, tokenizer, cfg, device, eval_iters=10):
     import torch
     out = {}
@@ -54,7 +67,15 @@ def estimate_loss(model, train_iter, val_iter, tokenizer, cfg, device, eval_iter
         losses = torch.zeros(eval_iters)
         for k in range(eval_iters):
             try:
-                X, Y = next(iterator)
+                batch = next(iterator)
+                
+                # Check if it's a dictionary (from DataLoader) or tuple (from fallback token_streamer)
+                if isinstance(batch, dict):
+                    X = batch['X'].to(device, non_blocking=True)
+                    Y = batch['Y'].to(device, non_blocking=True)
+                else:
+                    X, Y = batch[0].to(device), batch[1].to(device)
+                    
             except StopIteration:
                 from datasets import load_dataset
                 dataset_stream = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
@@ -64,8 +85,10 @@ def estimate_loss(model, train_iter, val_iter, tokenizer, cfg, device, eval_iter
                 else:
                     new_ds = dataset_stream.take(10000) 
                     
+                # Re-initialize the fallback streamer
                 iterator = token_streamer(new_ds, tokenizer, cfg.block_size, cfg.batch_size, device)
-                X, Y = next(iterator)
+                batch = next(iterator)
+                X, Y = batch[0], batch[1] # token_streamer yields tuples already on device
                 
             with torch.inference_mode(), torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 _, loss = model(X, targets=Y)
@@ -76,6 +99,7 @@ def estimate_loss(model, train_iter, val_iter, tokenizer, cfg, device, eval_iter
         
     model.train()
     return out
+
 
 def get_parameter_norm(model):
     total = 0.0
@@ -106,6 +130,70 @@ def get_lr(step, cfg):
     return cfg.min_lr + coeff * (
         cfg.learning_rate - cfg.min_lr
     )
+def tokenize_and_chunk(examples, tokenizer, block_size):
+    tokens = tokenizer(examples["text"], add_special_tokens=True)["input_ids"]
+    
+    # Flatten into a single long sequence of tokens
+    all_tokens = [t for seq in tokens for t in seq]
+    
+    # Calculate max lengths divisible by our target chunk size
+    seq_len = block_size + 1
+    total_length = (len(all_tokens) // seq_len) * seq_len
+    
+    # Chunk the flat list
+    X_batch, Y_batch = [], []
+    for i in range(0, total_length, seq_len):
+        chunk = all_tokens[i : i + seq_len]
+        X_batch.append(chunk[:-1])
+        Y_batch.append(chunk[1:])
+        
+    return {"X": X_batch, "Y": Y_batch}
+def get_dataloaders(rank, world_size, tokenizer, cfg):
+    from datasets import load_dataset
+    from datasets.distributed import split_dataset_by_node
+    from torch.utils.data import DataLoader
+    
+    # 1. Load the streaming dataset
+    dataset_stream = load_dataset(
+        "HuggingFaceTB/smollm-corpus", 
+        "cosmopedia-v2", 
+        split="train", 
+        streaming=True
+    )
+    
+    # 2. Shard correctly for DDP to prevent duplication across GPUs
+    dataset_stream = split_dataset_by_node(dataset_stream, rank=rank, world_size=world_size)
+    
+    # 3. Apply mapping on the fly using fn_kwargs for picklable arguments
+    tokenized_dataset = dataset_stream.map(
+        tokenize_and_chunk, 
+        batched=True, 
+        fn_kwargs={"tokenizer": tokenizer, "block_size": cfg.block_size}, # <-- Added this
+        remove_columns=list(dataset_stream.features.keys()) # Drop raw text
+    ).with_format("torch")
+
+    # Split for train/val
+    val_dataset = tokenized_dataset.take(2000)
+    train_dataset = tokenized_dataset.skip(2000)
+
+    # 4. Spawn background workers via PyTorch DataLoader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg.batch_size,
+        num_workers=4,           
+        prefetch_factor=2,       
+        pin_memory=True          
+    )
+    
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=cfg.batch_size,
+        num_workers=2,
+        pin_memory=True
+    )
+    
+    return train_loader, val_loader
+
 
 # --- DDP WORKER EXECUTION LOOP ---
 def ddp_worker(rank, world_size):
@@ -156,9 +244,16 @@ def ddp_worker(rank, world_size):
     print(f"[Rank {rank}] Building model...", flush=True)
     model = Gemma3LanguageModel(vocab_size=vocab_size).to(device)
     model.gradient_checkpointing_enable()
-    model = torch.compile(model)
+    
+    
     print(f"[Rank {rank}] DDP wrapping...", flush=True)
     model = DDP(model, device_ids=[rank])
+
+    import torch._dynamo
+    torch._dynamo.config.optimize_ddp = False
+    model = torch.compile(model)
+
+    
     raw_model = model.module
     decay = []
     no_decay = []
@@ -180,18 +275,11 @@ def ddp_worker(rank, world_size):
                     lr=cfg.learning_rate,
                     betas=(cfg.beta1, cfg.beta2),
                 )
-    print(f"[Rank {rank}] Loading dataset...")  
-    # Dataset stream setup
-    dataset_stream = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
+    print(f"[Rank {rank}] Loading and configuring dataset pipeline...")  
+    train_loader, val_loader = get_dataloaders(rank, world_size, tokenizer, cfg)
     
-    # Quick sharding strategy for streaming datasets across ranks to prevent identical processing
-    dataset_stream = dataset_stream.shard(num_shards=world_size, index=rank)
-    
-    val_dataset = dataset_stream.take(2000)
-    train_dataset = dataset_stream.skip(2000)
-
-    train_iterator = token_streamer(train_dataset, tokenizer, cfg.block_size, cfg.batch_size, device)
-    val_iterator = token_streamer(val_dataset, tokenizer, cfg.block_size, cfg.batch_size, device)
+    train_iterator = iter(train_loader)
+    val_iterator = iter(val_loader)
     
     model.train()
     print(f"[Rank {rank}] Starting training...", flush=True)
@@ -212,25 +300,24 @@ def ddp_worker(rank, world_size):
 
         
         # Micro-stepping accumulation loop
+        # Micro-stepping accumulation loop
         for micro_step in range(gradient_accumulation_steps):
-            # Toggle backward sync boundary check
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
             
             try:
-                X, Y = next(train_iterator)
+                batch = next(train_iterator)
             except StopIteration:
-                dataset_stream = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
-                dataset_stream = dataset_stream.shard(num_shards=world_size, index=rank)
-                train_dataset = dataset_stream.skip(2000)
-                train_iterator = token_streamer(train_dataset, tokenizer, cfg.block_size, cfg.batch_size, device)
-                X, Y = next(train_iterator)
+                # Re-initialize if we somehow exhaust the infinite stream
+                train_iterator = iter(train_loader)
+                batch = next(train_iterator)
+
+            # Move background-processed batches to the GPU
+            X = batch['X'].to(device, non_blocking=True)
+            Y = batch['Y'].to(device, non_blocking=True)
 
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 _, loss = model(X, targets=Y)
-                if loss.dim() > 0:  
-                    loss = loss.mean()
-                loss = loss / gradient_accumulation_steps
-        
+
             loss.backward()
 
 
@@ -314,7 +401,7 @@ def ddp_worker(rank, world_size):
 # --- 2. MODAL SERVERLESS SYSTEM ENTRYPOINT ---
 @app.function(
     image=training_image,
-    gpu="A10G:2",                                   
+    gpu="A10G:4",                                   
     timeout=86400,
     secrets=[
         modal.Secret.from_name("huggingface-secret"),

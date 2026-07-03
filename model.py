@@ -9,17 +9,20 @@ def rotate_half(x):
     x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
-
 def apply_rotary_pos_emb(q, k, cos, sin):
     """Applies RoPE to Q and K tensors."""
+    # --- ADD THESE TWO LINES ---
+    cos = cos.to(q.dtype)
+    sin = sin.to(q.dtype)
+    # ---------------------------
+    
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
     return q_embed, k_embed
-
 class Config:
     def __init__(self):
         self.block_size = 2048
-        self.batch_size = 2
+        self.batch_size = 16
         self.learnin_rate = 3e-4
         self.max_steps = 500000 
         self.n_embd = 1024
@@ -101,50 +104,63 @@ class GroupedQueryAttention(nn.Module):
         self.dropout_p = cfg.dropout
 
     def forward(self, x, cos, sin):
+        from flash_attn import flash_attn_func
+        
         B, T, C = x.shape
 
-        # Project and reshape
-        q = self.q_proj(x).view(B, T, self.num_q_heads, self.head_dim).transpose(1, 2)
-        k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
-        v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_dim).transpose(1, 2)
+        # Project and reshape (Keep as [B, T, Heads, Head_dim])
+        q = self.q_proj(x).view(B, T, self.num_q_heads, self.head_dim)
+        k = self.k_proj(x).view(B, T, self.num_kv_heads, self.head_dim)
+        v = self.v_proj(x).view(B, T, self.num_kv_heads, self.head_dim)
 
-        # now we normalize
+        # Normalize
         q = self.q_norm(q)
         k = self.k_norm(k)
 
-
+        # Temporarily transpose for RoPE, which expects [B, Heads, T, Head_dim] based on your cache
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
         q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        # Repeat the KV heads
-        k = torch.repeat_interleave(k, repeats=self.num_rep, dim=1)
-        v = torch.repeat_interleave(v, repeats=self.num_rep, dim=1)
+        
+        # Transpose back to [B, T, Heads, Head_dim] for flash_attn
+        q = q.transpose(1, 2)
+        k = k.transpose(1, 2)
 
-        # flash attention to make gpu go brrrr
+        # Repeat the KV heads for GQA
+        # Note: flash-attn actually supports passing GQA directly without repeating, 
+        # but to keep your logic intact and safe, we'll keep the repeat for now.
+        k = torch.repeat_interleave(k, repeats=self.num_rep, dim=2)
+        v = torch.repeat_interleave(v, repeats=self.num_rep, dim=2)
+        
+        
+        q = q.to(torch.bfloat16)
+        k = k.to(torch.bfloat16)
+        v = v.to(torch.bfloat16)
+        # The Magic: Hardware-accelerated Flash Attention 2
         if self.window_size is None:
-            # For global layers, PyTorch's native is_causal=True is hyper-optimized
-            out = F.scaled_dot_product_attention(
+            # Global causal attention (Every token looks at all previous tokens)
+            out = flash_attn_func(
                 q, k, v, 
-                attn_mask=None, 
                 dropout_p=self.dropout_p if self.training else 0.0, 
-                is_causal=True
+                causal=True
             )
         else:
-            # For Sliding Window layers, we pass our custom boolean mask
-            out = F.scaled_dot_product_attention(
+            # Sliding Window Attention (Tokens only look back 'window_size' steps)
+            out = flash_attn_func(
                 q, k, v, 
-                attn_mask=self.mask[:, :, :T, :T], 
                 dropout_p=self.dropout_p if self.training else 0.0, 
-                is_causal=False
+                causal=True, 
+                window_size=(self.window_size, 0)  # (Look back, Look forward)
             )
         
         # Reshape and project out
-        out = out.transpose(1, 2).contiguous().view(B, T, self.num_q_heads * self.head_dim)
+        out = out.contiguous().view(B, T, self.num_q_heads * self.head_dim)
         out = self.o_proj(out)
         
         # We manually apply dropout to the output projection
         out = F.dropout(out, p=self.dropout_p, training=self.training)
         
         return out
-
 class GemmaFeedForward(nn.Module):
   def __init__(self, n_embd):
     super().__init__()
