@@ -19,7 +19,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 class Config:
     def __init__(self):
         self.block_size = 2048
-        self.batch_size = 8
+        self.batch_size = 2
         self.learnin_rate = 3e-4
         self.max_steps = 500000 
         self.n_embd = 1024
@@ -30,7 +30,23 @@ class Config:
         self.head_size = self.n_embd // self.n_head
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.n_eval = 500
+        self.learning_rate = 3e-4
+        self.min_lr = 3e-5          # lr / 10
+        self.weight_decay = 0.1
 
+        self.beta1 = 0.9
+        self.beta2 = 0.95
+        self.eps = 1e-8
+
+        self.grad_clip = 1.0
+
+        self.warmup_steps = 2000
+        self.lr_decay_steps = 500000
+        self.max_steps = 500000
+
+        self.decay_lr = True
+
+        self.gradient_accumulation_steps = 8
         
 
 
@@ -132,9 +148,10 @@ class GroupedQueryAttention(nn.Module):
 class GemmaFeedForward(nn.Module):
   def __init__(self, n_embd):
     super().__init__()
-    self.gate = nn.Linear(n_embd, 4 * n_embd, bias=False)
-    self.up_proj = nn.Linear(n_embd, 4 * n_embd, bias=False)
-    self.down_proj = nn.Linear(4 * n_embd, n_embd, bias=False)
+    hidden_dim = int((8/3) * n_embd)  # 8/3 expansion factor as per Gemma architecture
+    self.gate = nn.Linear(n_embd, hidden_dim, bias=False)
+    self.up_proj = nn.Linear(n_embd, hidden_dim, bias=False)
+    self.down_proj = nn.Linear(hidden_dim, n_embd, bias=False)
     self.act_fn = nn.GELU(approximate='tanh')
     self.dropout = nn.Dropout(cfg.dropout)
 
@@ -199,6 +216,7 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
     self.lm_head.weight = self.token_embedding_table.weight
 
     self.dropout = nn.Dropout(cfg.dropout)
+    self.gradient_checkpointing = False
 
   def forward(self, idx, targets=None):
 
@@ -216,6 +234,10 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
     x = self.dropout(tok_emb) # Positional embeddings are no longer added here!
     
     for block in self.blocks:
+      if self.gradient_checkpointing and self.training:
+        x = torch.utils.checkpoint.checkpoint(block, x, cos, sin, use_reentrant=False,)
+        
+      else:
         x = block(x, cos, sin)
         
     x = self.final_norm(x)
@@ -242,6 +264,9 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
           idx_next = torch.multinomial(probs, num_samples=1) # (B, 1)
           idx = torch.cat((idx, idx_next), dim=1) # (B, T+1)
         return idx
+  
+  def gradient_checkpointing_enable(self):
+    self.gradient_checkpointing = True
 
 
 @torch.no_grad()
