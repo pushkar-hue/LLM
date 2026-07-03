@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
-
+from huggingface_hub import PyTorchModelHubMixin
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
@@ -19,13 +19,19 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 class Config:
     def __init__(self):
         self.block_size = 2048
+        self.batch_size = 8
+        self.learnin_rate = 3e-4
+        self.max_steps = 500000 
         self.n_embd = 1024
         self.n_head = 16         # Number of Query Heads
         self.n_kv_head = 4       # Number of Key/Value Heads (GQA ratio is 16:4 -> 4 Qs share 1 KV)
-        self.n_layer = 24
+        self.n_layer = 28
         self.dropout = 0.1
         self.head_size = self.n_embd // self.n_head
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.n_eval = 500
+
+        
 
 
 cfg = Config()
@@ -165,7 +171,7 @@ class Block(nn.Module):
 
 
 
-class Gemma3LanguageModel(nn.Module):
+class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
 
   def __init__(self, vocab_size):
     super().__init__()
@@ -199,7 +205,7 @@ class Gemma3LanguageModel(nn.Module):
     B, T = idx.shape # Corrected from B, T, C = idx.shape
 
     tok_emb = self.token_embedding_table(idx)
-    pos_emb = self.position_embedding_table(torch.arange(T, device=device))
+    # pos_emb = self.position_embedding_table(torch.arange(T, device=device))
     
     # did this to match the gemma architecture
     tok_emb = tok_emb*(cfg.n_embd**0.5)
