@@ -35,10 +35,10 @@ training_image = (
 app = modal.App("gemma3-pretraining-ddp")
 
 from huggingface_hub import HfApi
+import threading
 
 api = HfApi()
 
-# --- DATA STREAMER UTIL ---
 def token_streamer(dataset, tokenizer, block_size, batch_size, device):
     buffer = []
     for sample in dataset:
@@ -148,54 +148,46 @@ def tokenize_and_chunk(examples, tokenizer, block_size):
         Y_batch.append(chunk[1:])
         
     return {"X": X_batch, "Y": Y_batch}
-def get_dataloaders(rank, world_size, tokenizer, cfg):
+
+def get_dataloaders(rank, world_size, tokenizer, cfg, start_step=0):
     from datasets import load_dataset
     from datasets.distributed import split_dataset_by_node
     from torch.utils.data import DataLoader
     
-    # 1. Load the streaming dataset
-    dataset_stream = load_dataset(
-        "HuggingFaceTB/smollm-corpus", 
-        "cosmopedia-v2", 
-        split="train", 
-        streaming=True
-    )
-    
-    # 2. Shard correctly for DDP to prevent duplication across GPUs
+    dataset_stream = load_dataset("HuggingFaceTB/smollm-corpus", "cosmopedia-v2", split="train", streaming=True)
     dataset_stream = split_dataset_by_node(dataset_stream, rank=rank, world_size=world_size)
     
-    # 3. Apply mapping on the fly using fn_kwargs for picklable arguments
     tokenized_dataset = dataset_stream.map(
         tokenize_and_chunk, 
         batched=True, 
-        fn_kwargs={"tokenizer": tokenizer, "block_size": cfg.block_size}, # <-- Added this
-        remove_columns=list(dataset_stream.features.keys()) # Drop raw text
+        fn_kwargs={"tokenizer": tokenizer, "block_size": cfg.block_size},
+        remove_columns=list(dataset_stream.features.keys())
     ).with_format("torch")
 
-    # Split for train/val
+    # We cannot use skip() on a tokenized stream without causing a massive CPU bottleneck.
+    # The model will re-process the beginning of the stream, but with the loaded optimizer state.
     val_dataset = tokenized_dataset.take(2000)
-    train_dataset = tokenized_dataset.skip(2000)
+    train_dataset = tokenized_dataset.skip(2000) # Only skip the validation set
 
-    # 4. Spawn background workers via PyTorch DataLoader
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=cfg.batch_size,
-        num_workers=4,           
-        prefetch_factor=2,       
-        pin_memory=True          
-    )
-    
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=cfg.batch_size,
-        num_workers=2,
-        pin_memory=True
-    )
+    train_loader = DataLoader(train_dataset, batch_size=cfg.batch_size, num_workers=4, prefetch_factor=2, pin_memory=True)
+    val_loader = DataLoader(val_dataset, batch_size=cfg.batch_size, num_workers=2, pin_memory=True)
     
     return train_loader, val_loader
 
 
-# --- DDP WORKER EXECUTION LOOP ---
+def background_upload(local_path, repo_path, repo_id):
+    try:
+        print("Starting background upload to Hub...")
+        api.upload_file(
+            path_or_fileobj=local_path,
+            path_in_repo=repo_path,
+            repo_id=repo_id,
+            repo_type="model",
+        )
+        print("Upload complete!")
+    except Exception as e:
+        print(f"Background upload failed: {e}")
+
 def ddp_worker(rank, world_size):
     import torch
     import wandb
@@ -217,9 +209,8 @@ def ddp_worker(rank, world_size):
     cfg = Config()
     
     # Setup gradient accumulation settings scaled by world size
-    gradient_accumulation_steps = 4
-    if gradient_accumulation_steps % world_size == 0:
-        gradient_accumulation_steps //= world_size
+    if cfg.gradient_accumulation_steps % world_size == 0:
+        cfg.gradient_accumulation_steps //= world_size
 
     # Initialize W&B only on the master rank process
     if master_process:
@@ -257,7 +248,7 @@ def ddp_worker(rank, world_size):
     raw_model = model.module
     decay = []
     no_decay = []
-
+    start_step = cfg.start_step
     for name, param in raw_model.named_parameters():
         if not param.requires_grad:
             continue
@@ -274,18 +265,47 @@ def ddp_worker(rank, world_size):
                     ],
                     lr=cfg.learning_rate,
                     betas=(cfg.beta1, cfg.beta2),
+                    eps=cfg.eps
                 )
+
+    
     print(f"[Rank {rank}] Loading and configuring dataset pipeline...")  
     train_loader, val_loader = get_dataloaders(rank, world_size, tokenizer, cfg)
     
     train_iterator = iter(train_loader)
     val_iterator = iter(val_loader)
+
+    if start_step > 0:
+        try:
+            from huggingface_hub import hf_hub_download
+            
+            print(f"[Rank {rank}] Attempting to download Step {start_step} checkpoint...")
+            ckpt_path = hf_hub_download(
+                repo_id="notninja/gemma-500m-smollm", 
+                filename="checkpoint_latest.pt", 
+                repo_type="model",
+                revision="a6931f727d63b48d80b0314b137b4b03a66a9f22"  
+            )
+            
+            print(f"[Rank {rank}] Loading checkpoint into memory...")
+            checkpoint = torch.load(ckpt_path, map_location=device)
+            
+            # Restore the model weights and optimizer state
+            raw_model.load_state_dict(checkpoint["model"])
+            optimizer.load_state_dict(checkpoint["optimizer"])
+            start_step = checkpoint["step"]
+            
+            print(f"[Rank {rank}] Successfully time-traveled back to step {start_step}!")
+            
+        except Exception as e:
+            print(f"[Rank {rank}] Checkpoint load failed. ({e})")
+    
     
     model.train()
     print(f"[Rank {rank}] Starting training...", flush=True)
     t0 = time.time()
     optimizer.zero_grad(set_to_none=True)
-    for step in range(cfg.max_steps):
+    for step in range(start_step, cfg.max_steps):
 
         lr = get_lr(step, cfg)
         for param_group in optimizer.param_groups:
@@ -301,8 +321,8 @@ def ddp_worker(rank, world_size):
         
         # Micro-stepping accumulation loop
         # Micro-stepping accumulation loop
-        for micro_step in range(gradient_accumulation_steps):
-            model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
+        for micro_step in range(cfg.gradient_accumulation_steps):
+            model.require_backward_grad_sync = (micro_step == cfg.gradient_accumulation_steps - 1)
             
             try:
                 batch = next(train_iterator)
@@ -317,6 +337,8 @@ def ddp_worker(rank, world_size):
 
             with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
                 _, loss = model(X, targets=Y)
+            
+            loss = loss / cfg.gradient_accumulation_steps # scale the loss to account for gradient accumulation
 
             loss.backward()
 
@@ -333,13 +355,13 @@ def ddp_worker(rank, world_size):
         tokens_processed = (
             cfg.batch_size
             * cfg.block_size
-            * gradient_accumulation_steps
+            * cfg.gradient_accumulation_steps
             * world_size
         )
 
         samples_processed = (
             cfg.batch_size
-            * gradient_accumulation_steps
+            * cfg.gradient_accumulation_steps
             * world_size
         )
 
@@ -355,7 +377,7 @@ def ddp_worker(rank, world_size):
         eta_hours = remaining_steps * dt / 3600
         if master_process:
             wandb.log({
-            "train/loss": loss.item() * gradient_accumulation_steps,
+            "train/loss": loss.item() * cfg.gradient_accumulation_steps,
             "lr": lr,
             "grad_norm": grad_norm.item(),
             "param_norm": param_norm,
@@ -368,10 +390,8 @@ def ddp_worker(rank, world_size):
         torch.cuda.reset_peak_memory_stats()
         optimizer.zero_grad(set_to_none=True)
 
-        # Save Checkpoint State safely
-        if step > 0 and step % 5000 == 0 and master_process:
+        if step > 0 and step % 2000 == 0 and step != start_step and master_process:
             print(f"Saving checkpoint {step}")
-
             torch.save(
                 {
                     "step": step,
@@ -381,13 +401,12 @@ def ddp_worker(rank, world_size):
                 },
                 "checkpoint.pt",
             )
-
-            api.upload_file(
-                path_or_fileobj="checkpoint.pt",
-                path_in_repo="checkpoint_latest.pt",
-                repo_id="notninja/gemma-500m-smollm",
-                repo_type="model",
-            )
+            
+            # Fire and forget the upload; don't block Rank 0!
+            threading.Thread(
+                target=background_upload, 
+                args=("checkpoint.pt", "checkpoint_latest.pt", "notninja/gemma-500m-smollm")
+            ).start()
 
             # raw_model.push_to_hub(
             #     "notninja/gemma-500m-smollm",
@@ -398,7 +417,6 @@ def ddp_worker(rank, world_size):
         
     destroy_process_group()
 
-# --- 2. MODAL SERVERLESS SYSTEM ENTRYPOINT ---
 @app.function(
     image=training_image,
     gpu="A10G:4",                                   

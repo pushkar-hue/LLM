@@ -22,8 +22,7 @@ def apply_rotary_pos_emb(q, k, cos, sin):
 class Config:
     def __init__(self):
         self.block_size = 2048
-        self.batch_size = 16
-        self.learnin_rate = 3e-4
+        self.batch_size = 8
         self.max_steps = 500000 
         self.n_embd = 1024
         self.n_head = 16         # Number of Query Heads
@@ -33,22 +32,22 @@ class Config:
         self.head_size = self.n_embd // self.n_head
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.n_eval = 500
-        self.learning_rate = 3e-4
+        self.learning_rate = 2e-4
         self.min_lr = 3e-5          # lr / 10
         self.weight_decay = 0.1
 
         self.beta1 = 0.9
         self.beta2 = 0.95
-        self.eps = 1e-8
+        self.eps = 1e-5
 
         self.grad_clip = 1.0
 
         self.warmup_steps = 2000
-        self.lr_decay_steps = 6000000
-        self.max_steps = 6000000
+        self.lr_decay_steps = 60000
+        self.max_steps = 60000
 
         self.decay_lr = True
-
+        self.start_step = 7000
         self.gradient_accumulation_steps = 8
         
 
@@ -261,12 +260,12 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
     logits = self.lm_head(x)
 
     if targets is None:
+      logits = self.lm_head(x[:, [-1], :])  
       loss = None
     else:
       # C here is vocab_size
-      logits = logits.view(B*T, logits.shape[-1])
-      targets = targets.view(B*T)
-      loss = F.cross_entropy(logits, targets)
+  
+      loss = F.cross_entropy(logits.view(-1, logits.shape[-1]).float(), targets.view(-1), ignore_index=-1)
 
     return logits, loss
 
