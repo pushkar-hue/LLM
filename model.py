@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from torch.nn import functional as F
 from huggingface_hub import PyTorchModelHubMixin
-
+import math
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
     x1 = x[..., : x.shape[-1] // 2]
@@ -11,10 +11,8 @@ def rotate_half(x):
 
 def apply_rotary_pos_emb(q, k, cos, sin):
     """Applies RoPE to Q and K tensors."""
-    # --- ADD THESE TWO LINES ---
     cos = cos.to(q.dtype)
     sin = sin.to(q.dtype)
-    # ---------------------------
     
     q_embed = (q * cos) + (rotate_half(q) * sin)
     k_embed = (k * cos) + (rotate_half(k) * sin)
@@ -47,7 +45,7 @@ class Config:
         self.max_steps = 60000
 
         self.decay_lr = True
-        self.start_step = 7000
+        self.start_step = 0
         self.gradient_accumulation_steps = 8
         
 
@@ -90,6 +88,7 @@ class GroupedQueryAttention(nn.Module):
         self.k_proj = nn.Linear(cfg.n_embd, self.num_kv_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(cfg.n_embd, self.num_kv_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_q_heads * self.head_dim, cfg.n_embd, bias=False)
+        self.o_proj.SCALE_INIT = 1  
 
         # Q, k normalized to be consistent with the gemma architecture
         self.q_norm = nn.RMSNorm(self.head_dim)
@@ -169,6 +168,7 @@ class GemmaFeedForward(nn.Module):
     self.down_proj = nn.Linear(hidden_dim, n_embd, bias=False)
     self.act_fn = nn.GELU(approximate='tanh')
     self.dropout = nn.Dropout(cfg.dropout)
+    self.down_proj.SCALE_INIT = 1
 
   def forward(self, x):
     gate = self.gate(x)
@@ -285,22 +285,16 @@ class Gemma3LanguageModel(nn.Module, PyTorchModelHubMixin):
     self.gradient_checkpointing = True
   
   def _init_weights(self, module):
-
     if isinstance(module, nn.Linear):
-
-        torch.nn.init.normal_(
-            module.weight,
-            mean=0,
-            std=0.02
-        )
+        std = 0.02
+        # Automatically shrink the init scale for residual layers!
+        if hasattr(module, 'SCALE_INIT'):
+            std = 0.02 / math.sqrt(2 * cfg.n_layer)
+            
+        torch.nn.init.normal_(module.weight, mean=0, std=std)
 
     elif isinstance(module, nn.Embedding):
-
-        torch.nn.init.normal_(
-            module.weight,
-            mean=0,
-            std=0.02
-        )
+        torch.nn.init.normal_(module.weight, mean=0, std=0.02)
 
 @torch.no_grad()
 def estimate_loss(model_name):
